@@ -42,11 +42,11 @@ with st.sidebar:
         ["High Volatility (0.5%)","Low Volatility (0.15%)"])
     threshold = 0.005 if "High" in threshold_mode else 0.0015
 
-    # Options underlying + expiry with fallback
+    # Options underlying + expiry with robust fallback
     options_underlying = st.selectbox("Options Underlying:", ["SPY","QQQ"])
     opt = yf.Ticker(options_underlying)
 
-    # 1) attempt yfinance
+    # 1) attempt yfinance.options
     expirations = []
     try:
         expirations = opt.options
@@ -55,10 +55,10 @@ with st.sidebar:
     except Exception as e:
         st.warning(f"⚠️ yfinance.options error: {e}")
 
-    # 2) fallback to Yahoo REST
+    # 2) fallback to Yahoo REST JSON
     if not expirations:
         try:
-            url = f"https://query2.finance.yahoo.com/v7/finance/options/{options_underlying}"
+            url = f"https://query1.finance.yahoo.com/v7/finance/options/{options_underlying}"
             resp = requests.get(url, timeout=5).json()
             dates = resp["optionChain"]["result"][0]["expirationDates"]
             expirations = [
@@ -71,16 +71,22 @@ with st.sidebar:
     # 3) fallback to cached list
     if not expirations:
         expirations = st.session_state.get("expirations_cache", [])
-        st.warning("⚠️ Using cached expirations list")
 
-    # 4) abort if still empty
+    # 4) if still empty, ask user to pick date manually
     if not expirations:
-        st.error("❌ No expirations available.")
-        st.stop()
-
-    # 5) cache & select
-    st.session_state["expirations_cache"] = expirations
-    selected_expiry = st.selectbox("Select Expiry Date:", expirations)
+        st.error("❌ Could not fetch expirations automatically.")
+        manual_dt = st.date_input(
+            "Enter Expiration Date manually:",
+            min_value=datetime.date.today()
+        )
+        # coerce into list for downstream logic
+        expirations = [manual_dt.isoformat()]
+        st.session_state["expirations_cache"] = expirations
+        selected_expiry = expirations[0]
+    else:
+        # cache & show selectbox
+        st.session_state["expirations_cache"] = expirations
+        selected_expiry = st.selectbox("Select Expiry Date:", expirations)
 
 # — Auto-refresh —
 st_autorefresh(interval=refresh_time * 1000, key="refresh")
@@ -95,21 +101,17 @@ def load_data(tkr, per, intr):
         info = ticker.info
         hist.to_csv(cache_file)
         return hist, info
-    except Exception as e:
+    except Exception:
         if os.path.exists(cache_file):
-            try:
-                hist = pd.read_csv(cache_file, index_col=0, parse_dates=True)
-                return hist, {"shortName": tkr}
-            except:
-                pass
+            hist = pd.read_csv(cache_file, index_col=0, parse_dates=True)
+            return hist, {"shortName": tkr}
         return pd.DataFrame(), {"shortName": tkr}
 
 # — Validate period+interval combos —
 def validate_combo(p, i):
     minute_limits = {"2m":60,"5m":60,"15m":60,"30m":60,"60m":730,"90m":60}
-    if i in minute_limits:
-        if p.endswith("y") or p in ["max","ytd","10y","5y"]:
-            return False
+    if i in minute_limits and (p.endswith("y") or p in ["max","ytd","10y","5y"]):
+        return False
     return True
 
 if not validate_combo(period, interval):
@@ -136,9 +138,9 @@ st.subheader(f"📈 {stock.upper()} Price Indicators")
 data["MA10"] = data["Close"].rolling(10).mean()
 vwap = (data["Close"] * data["Volume"]).cumsum() / data["Volume"].cumsum()
 fig1, ax1 = plt.subplots(figsize=(14,6))
-ax1.plot(data.index, data["Close"], label="Close", color="cyan")
-ax1.plot(data.index, data["MA10"], label="MA10", color="orange")
-ax1.plot(data.index, vwap, label="VWAP", color="green")
+ax1.plot(data.index, data["Close"], color="cyan", label="Close")
+ax1.plot(data.index, data["MA10"], color="orange", label="MA10")
+ax1.plot(data.index, vwap, color="green", label="VWAP")
 ax1.set_title(f"{stock.upper()} Close │ MA10 │ VWAP", color="white")
 ax1.set_facecolor("black"); fig1.patch.set_facecolor("black")
 ax1.tick_params(colors="white"); ax1.legend()
@@ -150,8 +152,7 @@ fig2, ax2 = plt.subplots(figsize=(14,3))
 ax2.bar(data.index, data["Volume"], color="purple")
 ax2.set_title("Volume", color="white")
 ax2.set_facecolor("black"); fig2.patch.set_facecolor("black")
-ax2.tick_params(colors="white")
-st.pyplot(fig2)
+ax2.tick_params(colors="white"); st.pyplot(fig2)
 
 # — Prediction Module —
 st.subheader(f"🔮 {stock.upper()} 30-Minute Prediction")
@@ -170,14 +171,12 @@ if len(close_data) >= 200:
         fig, ax = plt.subplots(figsize=(14,6))
         ax.plot(data.index[-300:], recent, color="cyan", label="Hist Close")
         ax.plot(idx, fc, color="red", label="Forecast")
-        if change > threshold:
-            ax.annotate("📈 Buy", xy=(idx[-1],fc.iloc[-1]),
-                        xytext=(idx[-1],fc.iloc[-1]+0.5),
+        if change>threshold:
+            ax.annotate("📈 Buy", xy=(idx[-1],fc.iloc[-1]), xytext=(idx[-1],fc.iloc[-1]+0.5),
                         arrowprops=dict(facecolor="green"))
             st.success("📈 Buy Signal")
-        elif change < -threshold:
-            ax.annotate("📉 Sell", xy=(idx[-1],fc.iloc[-1]),
-                        xytext=(idx[-1],fc.iloc[-1]-0.5),
+        elif change< -threshold:
+            ax.annotate("📉 Sell", xy=(idx[-1],fc.iloc[-1]), xytext=(idx[-1],fc.iloc[-1]-0.5),
                         arrowprops=dict(facecolor="red"))
             st.error("📉 Sell Signal")
         else:
@@ -191,11 +190,11 @@ if len(close_data) >= 200:
         st.info("Training LSTM…")
         scaler = MinMaxScaler()
         scaled = scaler.fit_transform(recent.values.reshape(-1,1))
-        X, y = [], []
+        X,y = [],[]
         lb = 60
         for i in range(lb, len(scaled)):
             X.append(scaled[i-lb:i,0]); y.append(scaled[i,0])
-        X, y = np.array(X), np.array(y)
+        X,y = np.array(X), np.array(y)
         X = X.reshape(X.shape[0], X.shape[1], 1)
         net = Sequential([
             LSTM(50, return_sequences=True, input_shape=(lb,1)),
@@ -204,24 +203,22 @@ if len(close_data) >= 200:
         ])
         net.compile("adam","mean_squared_error")
         net.fit(X, y, epochs=10, batch_size=8, verbose=0)
-        seq = scaled[-lb:]; preds = []
+        seq = scaled[-lb:]; preds=[]
         for _ in range(30):
             p = net.predict(seq.reshape(1,lb,1), verbose=0)[0,0]
-            preds.append(p); seq = np.append(seq, p)[-lb:]
+            preds.append(p); seq = np.append(seq,p)[-lb:]
         preds = scaler.inverse_transform(np.array(preds).reshape(-1,1)).flatten()
         idx = pd.date_range(start=data.index[-1], periods=30, freq="T")
         change = (preds[-1] - recent.iloc[-1]) / recent.iloc[-1]
         fig, ax = plt.subplots(figsize=(14,6))
         ax.plot(data.index[-300:], recent, color="cyan", label="Hist Close")
         ax.plot(idx, preds, color="red", label="Forecast")
-        if change > threshold:
-            ax.annotate("📈 Buy", xy=(idx[-1],preds[-1]),
-                        xytext=(idx[-1],preds[-1]+0.5),
+        if change>threshold:
+            ax.annotate("📈 Buy", xy=(idx[-1],preds[-1]), xytext=(idx[-1],preds[-1]+0.5),
                         arrowprops=dict(facecolor="green"))
             st.success("📈 Buy Signal")
-        elif change < -threshold:
-            ax.annotate("📉 Sell", xy=(idx[-1],preds[-1]),
-                        xytext=(idx[-1],preds[-1]-0.5),
+        elif change< -threshold:
+            ax.annotate("📉 Sell", xy=(idx[-1],preds[-1]), xytext=(idx[-1],preds[-1]-0.5),
                         arrowprops=dict(facecolor="red"))
             st.error("📉 Sell Signal")
         else:
@@ -235,7 +232,7 @@ if len(close_data) >= 200:
         st.info("Training Prophet…")
         dfp = pd.DataFrame({
             "ds": data.index[-300:].tz_localize(None),
-            "y": recent
+            "y" : recent
         })
         m = Prophet(daily_seasonality=True).fit(dfp)
         fut = m.make_future_dataframe(periods=30, freq="min")
@@ -244,12 +241,12 @@ if len(close_data) >= 200:
         fig, ax = plt.subplots(figsize=(14,6))
         ax.plot(dfp["ds"], dfp["y"], color="cyan", label="Hist Close")
         ax.plot(fcst["ds"][-30:], fcst["yhat"][-30:], color="red", label="Forecast")
-        if change > threshold:
+        if change>threshold:
             ax.annotate("📈 Buy", xy=(fcst["ds"].iloc[-1],fcst["yhat"].iloc[-1]),
                         xytext=(fcst["ds"].iloc[-1],fcst["yhat"].iloc[-1]+0.5),
                         arrowprops=dict(facecolor="green"))
             st.success("📈 Buy Signal")
-        elif change < -threshold:
+        elif change< -threshold:
             ax.annotate("📉 Sell", xy=(fcst["ds"].iloc[-1],fcst["yhat"].iloc[-1]),
                         xytext=(fcst["ds"].iloc[-1],fcst["yhat"].iloc[-1]-0.5),
                         arrowprops=dict(facecolor="red"))
@@ -260,7 +257,6 @@ if len(close_data) >= 200:
         rmse = np.sqrt(mean_squared_error(recent[-30:], fcst["yhat"][-30:]))
         mape = mean_absolute_percentage_error(recent[-30:], fcst["yhat"][-30:])
         st.markdown(f"**RMSE:** {rmse:.4f}   **MAPE:** {mape*100:.2f}%")
-
 else:
     st.info(f"⌛ Waiting for 200+ data points (current: {len(close_data)})...")
 
@@ -290,24 +286,24 @@ else:
     ax.set_facecolor("black"); fig.patch.set_facecolor("black")
     ax.tick_params(colors="white"); st.pyplot(fig)
 
-# — Option Gamma Exposure (GEX) —
+# — Option Gamma Exposure (GEX) Strategy —
 st.subheader("⚙️ Option Gamma Exposure (GEX) Strategy")
 spot = data["Close"].iloc[-1]
 exp_date = datetime.date.fromisoformat(selected_expiry)
 now = datetime.datetime.now()
 exp_dt = datetime.datetime.combine(exp_date, datetime.time(15,30))
-T = max((exp_dt-now).total_seconds(),0) / (365*24*3600)
+T = max((exp_dt-now).total_seconds(),0)/(365*24*3600)
 
 def bs_gamma(S,K,T,sigma,r=0,q=0):
     d1 = (np.log(S/K)+(r-q+0.5*sigma**2)*T)/(sigma*np.sqrt(T))
     return np.exp(-q*T)*norm.pdf(d1)/(S*sigma*np.sqrt(T))
 
-rows = []
+rows=[]
 for _, r in df_opts.dropna(subset=["impliedVolatility","openInterest"]).iterrows():
     σ = r.impliedVolatility or 1e-6
     oi = r.openInterest or 0
     γ = bs_gamma(spot, r.strike, T, σ)
-    rows.append((r.type, r.strike, γ*oi*100))
+    rows.append((r.type,r.strike,γ*oi*100))
 
 gex_df = pd.DataFrame(rows, columns=["type","strike","gex"])
 call_gex = gex_df.query("type=='call'")["gex"].sum()
@@ -320,7 +316,7 @@ with st.sidebar.expander("🔍 GEX Metrics", expanded=True):
     st.metric("Net  GEX", f"{net_gex:,.0f}")
 
 fig, ax = plt.subplots(figsize=(12,4))
-gex_plot = gex_df.assign(net=lambda d: d["gex"].where(d["type"]=="call", -d["gex"]))
+gex_plot = gex_df.assign(net=lambda d: d["gex"].where(d["type"]=="call",-d["gex"]))
 gex_plot = gex_plot.groupby("strike")["net"].sum().reset_index()
 ax.bar(
     gex_plot["strike"], gex_plot["net"],
@@ -339,7 +335,8 @@ def fetch_news(tkr):
     url = f"https://news.google.com/search?q={tkr}+stock&hl=en-US&gl=US&ceid=US%3Aen"
     r = requests.get(url)
     soup = BeautifulSoup(r.text, "html.parser")
-    return ["https://news.google.com"+a["href"][1:] for a in soup.select("a.DY5T1d")][:3]
+    return ["https://news.google.com"+a["href"][1:] 
+            for a in soup.select("a.DY5T1d")][:3]
 
 for link in fetch_news(stock):
     try:
