@@ -1,3 +1,4 @@
+import os
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -36,9 +37,11 @@ with st.sidebar:
     )
     interval = st.selectbox(
         "History Interval:",
-        ["1m","2m","5m","15m","30m","60m","90m","1d","1wk","1mo"]
+        ["2m","5m","15m","30m","60m","90m","1d","1wk","1mo"]  # removed 1m to reduce rate-limit pressure
     )
-    refresh_time = st.slider("Refresh Interval (sec):", 60, 1800, 300)
+    refresh_time = st.slider(
+        "Refresh Interval (sec):", 300, 3600, 600
+    )  # min 5 min, default 10 min, max 1 h
     threshold_mode = st.radio(
         "Signal Sensitivity:",
         ["High Volatility (0.5%)","Low Volatility (0.15%)"]
@@ -49,23 +52,32 @@ with st.sidebar:
 # — Auto-refresh —
 st_autorefresh(interval=refresh_time * 1000, key="refresh")
 
-# — Load data with rate-limit handling —
-@st.cache_data(ttl=refresh_time)
+# — Data loader with CSV fallback & extended TTL —
+@st.cache_data(ttl=600)  # cache for 10 minutes
 def load_data(tkr, per, intr):
-    t = yf.Ticker(tkr)
+    cache_file = "cache.csv"
     try:
+        t = yf.Ticker(tkr)
         hist = t.history(period=per, interval=intr)
         info = t.info
+        # save to CSV for fallback
+        hist.to_csv(cache_file)
         return hist, info
-    except YFRateLimitError:
-        return None, None
+    except Exception as e:
+        print("load_data error:", e)
+        if os.path.exists(cache_file):
+            try:
+                hist = pd.read_csv(cache_file, index_col=0, parse_dates=True)
+                return hist, {}
+            except Exception as e2:
+                print("CSV fallback read error:", e2)
+        return pd.DataFrame(), {}
 
+# — Validate period+interval combos —
 def validate_combo(p, i):
-    minute_limits = {"1m":7,"2m":60,"5m":60,"15m":60,"30m":60,"60m":730,"90m":60}
+    minute_limits = {"2m":60,"5m":60,"15m":60,"30m":60,"60m":730,"90m":60}
     if i in minute_limits:
         if p.endswith("y") or p in ["max","ytd","10y","5y"]:
-            return False
-        if i=="1m" and p not in ["1d","5d","7d"]:
             return False
     return True
 
@@ -74,8 +86,8 @@ if not validate_combo(period, interval):
     st.stop()
 
 data, info = load_data(stock.upper(), period, interval)
-if data is None or info is None:
-    st.error("⚠️ Yahoo Finance rate limit hit. Try again later or increase refresh interval.")
+if data.empty or not info:
+    st.error("⚠️ Could not fetch data (rate limiting or other error).")
     st.stop()
 
 # — Company Overview —
@@ -113,7 +125,7 @@ ax2.tick_params(colors="white")
 st.pyplot(fig2)
 
 # — Prediction Module —
-st.subheader(f"🔮 {stock.upper()} 30-Min Prediction")
+st.subheader(f"🔮 {stock.upper()} 30-Minute Prediction")
 model_choice = st.radio("Model:", ["Auto-ARIMA","LSTM","Prophet"], horizontal=True)
 close_data = data["Close"].dropna()
 
@@ -122,7 +134,7 @@ if len(close_data) >= 200:
 
     # Auto-ARIMA
     if model_choice == "Auto-ARIMA":
-        st.info("Training ARIMA...")
+        st.info("Training ARIMA…")
         arima_model = ARIMA(recent, order=(3,1,2)).fit()
         forecast = arima_model.forecast(steps=30)
         future_idx = pd.date_range(start=data.index[-1], periods=30, freq="T")
@@ -154,31 +166,27 @@ if len(close_data) >= 200:
 
     # LSTM
     elif model_choice == "LSTM":
-        st.info("Training LSTM...")
+        st.info("Training LSTM…")
         scaler = MinMaxScaler()
         scaled = scaler.fit_transform(recent.values.reshape(-1,1))
         X, y = [], []
-        lookback = 60
-        for i in range(lookback, len(scaled)):
-            X.append(scaled[i-lookback:i,0])
-            y.append(scaled[i,0])
+        lb = 60
+        for i in range(lb, len(scaled)):
+            X.append(scaled[i-lb:i,0]); y.append(scaled[i,0])
         X, y = np.array(X), np.array(y)
         X = X.reshape(X.shape[0], X.shape[1], 1)
 
         lstm_model = Sequential([
-            LSTM(50, return_sequences=True, input_shape=(lookback,1)),
-            LSTM(50),
-            Dense(1)
+            LSTM(50, return_sequences=True, input_shape=(lb,1)),
+            LSTM(50), Dense(1)
         ])
         lstm_model.compile("adam", "mean_squared_error")
         lstm_model.fit(X, y, epochs=10, batch_size=8, verbose=0)
 
-        seq = scaled[-lookback:]
-        preds = []
+        seq = scaled[-lb:]; preds = []
         for _ in range(30):
-            p = lstm_model.predict(seq.reshape(1,lookback,1), verbose=0)[0,0]
-            preds.append(p)
-            seq = np.append(seq, p)[-lookback:]
+            p = lstm_model.predict(seq.reshape(1,lb,1), verbose=0)[0,0]
+            preds.append(p); seq = np.append(seq, p)[-lb:]
         preds = scaler.inverse_transform(np.array(preds).reshape(-1,1)).flatten()
         future_idx = pd.date_range(start=data.index[-1], periods=30, freq="T")
         change = (preds[-1] - recent.iloc[-1]) / recent.iloc[-1]
@@ -206,7 +214,7 @@ if len(close_data) >= 200:
 
     # Prophet
     else:
-        st.info("Training Prophet...")
+        st.info("Training Prophet…")
         dfp = pd.DataFrame({
             "ds": data.index[-300:].tz_localize(None),
             "y": recent
@@ -240,13 +248,13 @@ if len(close_data) >= 200:
 else:
     st.info(f"⌛ Waiting for 200+ data points (current: {len(close_data)})...")
 
-# — Intraday Options Strategy & Large Option Flow —
-st.subheader("⚡ Intraday Options Strategy & Large Option Flow")
-opt_tkr = yf.Ticker(options_underlying)
-exps = opt_tkr.options
+# — Intraday Options & Large Option Flow —
+st.subheader("⚡ Intraday Options & Large Option Flow")
+opt = yf.Ticker(options_underlying)
+exps = opt.options
 if exps:
     nearest = exps[0]
-    chain = opt_tkr.option_chain(nearest)
+    chain = opt.option_chain(nearest)
     calls = chain.calls.assign(type="call", expiration=nearest)
     puts  = chain.puts.assign(type="put", expiration=nearest)
     df_opts = pd.concat([calls, puts], ignore_index=True)
@@ -254,7 +262,6 @@ if exps:
     thresh = df_opts["volume"].quantile(0.95)
     large = df_opts[df_opts["volume"] >= thresh]
 
-    # English header and chart title
     st.markdown(
         f"### Large Option Trades (Volume ≥ {thresh:.0f}, 95th percentile) "
         f"for {options_underlying} exp {nearest}"
@@ -294,4 +301,5 @@ for link in fetch_news(stock):
         st.markdown("---")
     except:
         continue
+
 
