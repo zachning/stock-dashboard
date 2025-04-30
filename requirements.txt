@@ -10,6 +10,8 @@ prophet
 cmdstanpy
 tensorflow
 newspaper3k
+lxml
+lxml_html_clean
 beautifulsoup4
 requests
 scipy
