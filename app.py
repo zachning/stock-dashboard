@@ -2,160 +2,162 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
+from yfinance.exceptions import YFRateLimitError
 import matplotlib.pyplot as plt
 from sklearn.metrics import mean_squared_error, mean_absolute_percentage_error
-from streamlit_autorefresh import st_autorefresh
-import requests
-from bs4 import BeautifulSoup
-from newspaper import Article
-from prophet import Prophet
-from statsmodels.tsa.arima.model import ARIMA
 from sklearn.preprocessing import MinMaxScaler
+from streamlit_autorefresh import st_autorefresh
+from statsmodels.tsa.arima.model import ARIMA
+from prophet import Prophet
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Dense, LSTM
+from bs4 import BeautifulSoup
+from newspaper import Article
+import requests
 
-# 页面配置
-st.set_page_config(page_title="Stock Dashboard", layout="wide", initial_sidebar_state="expanded")
+# — Page config —
+st.set_page_config(
+    page_title="Stock & Options Dashboard",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 st.markdown(
-    "<h1 style='text-align: center; color: white;'>📈 Real-Time Stock Monitoring Dashboard (Pro Version)</h1>",
+    "<h1 style='text-align:center; color:white;'>📈 Real-Time Stock & Options Dashboard</h1>",
     unsafe_allow_html=True
 )
 
-# Sidebar 控件
+# — Sidebar controls —
 with st.sidebar:
     st.header("⚙️ Controls")
-    stock = st.text_input("Enter Stock/Crypto Ticker:", value="AAPL")
+    stock = st.text_input("Stock/Crypto Ticker:", value="AAPL")
     period = st.selectbox(
-        "Select Period:",
-        ["1d", "5d", "7d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "ytd", "max"]
+        "History Period:",
+        ["1d","5d","7d","1mo","3mo","6mo","1y","2y","5y","10y","ytd","max"]
     )
     interval = st.selectbox(
-        "Select Interval:",
-        ["1m", "2m", "5m", "15m", "30m", "60m", "90m", "1d", "1wk", "1mo"]
+        "History Interval:",
+        ["1m","2m","5m","15m","30m","60m","90m","1d","1wk","1mo"]
     )
-    refresh_time = st.slider("Refresh Interval (Seconds):", 10, 300, 60)
+    refresh_time = st.slider("Refresh Interval (sec):", 60, 1800, 300)
     threshold_mode = st.radio(
-        "Select Signal Sensitivity:",
-        ["High Volatility (0.5%)", "Low Volatility (0.15%)"]
+        "Signal Sensitivity:",
+        ["High Volatility (0.5%)","Low Volatility (0.15%)"]
     )
-    threshold = 0.005 if threshold_mode.startswith("High") else 0.0015
+    threshold = 0.005 if "High" in threshold_mode else 0.0015
+    options_underlying = st.selectbox("Options Underlying:", ["SPY","QQQ"])
 
+# — Auto-refresh —
 st_autorefresh(interval=refresh_time * 1000, key="refresh")
 
+# — Load data with rate-limit handling —
 @st.cache_data(ttl=refresh_time)
-def load_data(ticker, period, interval):
-    t = yf.Ticker(ticker)
-    hist = t.history(period=period, interval=interval)
-    info = t.info
-    return hist, info
+def load_data(tkr, per, intr):
+    t = yf.Ticker(tkr)
+    try:
+        hist = t.history(period=per, interval=intr)
+        info = t.info
+        return hist, info
+    except YFRateLimitError:
+        return None, None
 
-def validate_combo(period, interval):
-    minute_intervals = {
-        "1m": 7, "2m": 60, "5m": 60, "15m": 60,
-        "30m": 60, "60m": 730, "90m": 60
-    }
-    if interval in minute_intervals:
-        if period.endswith("y") or period in ["max", "ytd", "10y", "5y"]:
+def validate_combo(p, i):
+    minute_limits = {"1m":7,"2m":60,"5m":60,"15m":60,"30m":60,"60m":730,"90m":60}
+    if i in minute_limits:
+        if p.endswith("y") or p in ["max","ytd","10y","5y"]:
             return False
-        if interval == "1m" and period not in ["1d", "5d", "7d"]:
+        if i=="1m" and p not in ["1d","5d","7d"]:
             return False
     return True
 
 if not validate_combo(period, interval):
-    st.warning("⚠️ This period + interval combination is not supported by Yahoo Finance.")
+    st.warning("⚠️ This period+interval combo is not supported.")
     st.stop()
 
 data, info = load_data(stock.upper(), period, interval)
+if data is None or info is None:
+    st.error("⚠️ Yahoo Finance rate limit hit. Try again later or increase refresh interval.")
+    st.stop()
 
-# 公司信息
+# — Company Overview —
 st.subheader("🏢 Company Overview")
 try:
-    domain = info.get('website','').replace("https://","").replace("http://","").split("/")[0]
+    domain = info.get("website","").replace("https://","").replace("http://","").split("/")[0]
     if domain:
-        st.image(f"https://logo.clearbit.com/{domain}", width=120)
+        st.image(f"https://logo.clearbit.com/{domain}", width=100)
     st.markdown(f"### {info.get('shortName', stock.upper())}")
-    if info.get('website'):
-        st.markdown(f"[Visit Official Website]({info['website']})")
-except Exception:
-    st.warning("⚠️ Unable to load company logo or website.")
+    if info.get("website"):
+        st.markdown(f"[Visit Website]({info['website']})")
+except:
+    st.warning("⚠️ Could not load logo or website.")
 
-# Close / MA10 / VWAP
-st.subheader(f"📈 {stock.upper()} Price with MA10 & VWAP")
-data['MA10'] = data['Close'].rolling(window=10).mean()
-vwap = (data['Close'] * data['Volume']).cumsum() / data['Volume'].cumsum()
-
+# — Price / MA10 / VWAP Chart —
+st.subheader(f"📈 {stock.upper()} Price Indicators")
+data["MA10"] = data["Close"].rolling(10).mean()
+vwap = (data["Close"] * data["Volume"]).cumsum() / data["Volume"].cumsum()
 fig1, ax1 = plt.subplots(figsize=(14,6))
-ax1.plot(data.index, data['Close'], label='Close', color='cyan')
-ax1.plot(data.index, data['MA10'], label='MA10', color='orange')
-ax1.plot(data.index, vwap, label='VWAP', color='green')
-ax1.set_title(f"{stock.upper()} Close / MA10 / VWAP", color='white')
-ax1.set_facecolor('black')
-fig1.patch.set_facecolor('black')
-ax1.tick_params(colors='white')
-ax1.legend()
+ax1.plot(data.index, data["Close"], label="Close", color="cyan")
+ax1.plot(data.index, data["MA10"], label="MA10", color="orange")
+ax1.plot(data.index, vwap, label="VWAP", color="green")
+ax1.set_title(f"{stock.upper()} Close │ MA10 │ VWAP", color="white")
+ax1.set_facecolor("black"); fig1.patch.set_facecolor("black")
+ax1.tick_params(colors="white"); ax1.legend()
 st.pyplot(fig1)
 
-# Volume
+# — Volume Chart —
 st.subheader(f"📊 {stock.upper()} Volume")
 fig2, ax2 = plt.subplots(figsize=(14,3))
-ax2.bar(data.index, data['Volume'], color='purple')
-ax2.set_title("Volume", color='white')
-ax2.set_facecolor('black')
-fig2.patch.set_facecolor('black')
-ax2.tick_params(colors='white')
+ax2.bar(data.index, data["Volume"], color="purple")
+ax2.set_title("Volume", color="white")
+ax2.set_facecolor("black"); fig2.patch.set_facecolor("black")
+ax2.tick_params(colors="white")
 st.pyplot(fig2)
 
-# 🔮 预测模块
-st.subheader(f"🔮 {stock.upper()} 30-Minute Price Prediction")
-model_choice = st.radio(
-    "Select Prediction Model:",
-    ["Auto-ARIMA", "LSTM Deep Learning", "Prophet Forecasting"],
-    horizontal=True
-)
+# — Prediction Module —
+st.subheader(f"🔮 {stock.upper()} 30-Min Prediction")
+model_choice = st.radio("Model:", ["Auto-ARIMA","LSTM","Prophet"], horizontal=True)
+close_data = data["Close"].dropna()
 
-close_data = data['Close'].dropna()
 if len(close_data) >= 200:
-    recent_data = close_data.tail(300)
+    recent = close_data.tail(300)
 
-    # — Auto-ARIMA 使用 statsmodels —
+    # Auto-ARIMA
     if model_choice == "Auto-ARIMA":
-        st.info("Training statsmodels ARIMA model...")
-        order = (3,1,2)
-        arima = ARIMA(recent_data, order=order)
-        fit = arima.fit()
-        arima_forecast = fit.forecast(steps=30)
-
-        future_index = pd.date_range(start=data.index[-1], periods=30, freq='T')
-        change = (arima_forecast.iloc[-1] - recent_data.iloc[-1]) / recent_data.iloc[-1]
+        st.info("Training ARIMA...")
+        arima_model = ARIMA(recent, order=(3,1,2)).fit()
+        forecast = arima_model.forecast(steps=30)
+        future_idx = pd.date_range(start=data.index[-1], periods=30, freq="T")
+        change = (forecast.iloc[-1] - recent.iloc[-1]) / recent.iloc[-1]
 
         fig, ax = plt.subplots(figsize=(14,6))
-        ax.plot(data.index[-300:], recent_data, label='Historical Close', color='cyan')
-        ax.plot(future_index, arima_forecast, label='Forecast', color='red')
+        ax.plot(data.index[-300:], recent, label="Historical Close", color="cyan")
+        ax.plot(future_idx, forecast, label="Forecast", color="red")
         if change > threshold:
-            ax.annotate('📈 Buy', xy=(future_index[-1], arima_forecast.iloc[-1]),
-                        xytext=(future_index[-1], arima_forecast.iloc[-1]+0.5),
-                        arrowprops=dict(facecolor='green', shrink=0.05))
-            st.success("📈 Buy Signal Detected!")
+            ax.annotate("📈 Buy", xy=(future_idx[-1], forecast.iloc[-1]),
+                        xytext=(future_idx[-1], forecast.iloc[-1]+0.5),
+                        arrowprops=dict(facecolor="green", shrink=0.05))
+            st.success("📈 Buy Signal")
         elif change < -threshold:
-            ax.annotate('📉 Sell', xy=(future_index[-1], arima_forecast.iloc[-1]),
-                        xytext=(future_index[-1], arima_forecast.iloc[-1]-0.5),
-                        arrowprops=dict(facecolor='red', shrink=0.05))
-            st.error("📉 Sell Signal Detected!")
+            ax.annotate("📉 Sell", xy=(future_idx[-1], forecast.iloc[-1]),
+                        xytext=(future_idx[-1], forecast.iloc[-1]-0.5),
+                        arrowprops=dict(facecolor="red", shrink=0.05))
+            st.error("📉 Sell Signal")
         else:
-            st.info("⏸️ Hold (No strong signal)")
-
-        ax.set_facecolor('black')
-        fig.patch.set_facecolor('black')
-        ax.tick_params(colors='white')
-        ax.legend()
+            st.info("⏸️ Hold")
         st.pyplot(fig)
 
-    # — LSTM 深度学习 —
-    elif model_choice == "LSTM Deep Learning":
-        st.info("Training LSTM deep learning model...")
+        # RMSE & MAPE
+        y_true = recent[-30:].values
+        y_pred = forecast.values
+        rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+        mape = mean_absolute_percentage_error(y_true, y_pred)
+        st.markdown(f"**RMSE:** {rmse:.4f}   **MAPE:** {mape*100:.2f}%")
+
+    # LSTM
+    elif model_choice == "LSTM":
+        st.info("Training LSTM...")
         scaler = MinMaxScaler()
-        scaled = scaler.fit_transform(recent_data.values.reshape(-1,1))
-        X,y = [],[]
+        scaled = scaler.fit_transform(recent.values.reshape(-1,1))
+        X, y = [], []
         lookback = 60
         for i in range(lookback, len(scaled)):
             X.append(scaled[i-lookback:i,0])
@@ -163,109 +165,133 @@ if len(close_data) >= 200:
         X, y = np.array(X), np.array(y)
         X = X.reshape(X.shape[0], X.shape[1], 1)
 
-        model = Sequential()
-        model.add(LSTM(50, return_sequences=True, input_shape=(X.shape[1],1)))
-        model.add(LSTM(50))
-        model.add(Dense(1))
-        model.compile(optimizer='adam', loss='mean_squared_error')
-        model.fit(X, y, epochs=10, batch_size=8, verbose=0)
+        lstm_model = Sequential([
+            LSTM(50, return_sequences=True, input_shape=(lookback,1)),
+            LSTM(50),
+            Dense(1)
+        ])
+        lstm_model.compile("adam", "mean_squared_error")
+        lstm_model.fit(X, y, epochs=10, batch_size=8, verbose=0)
 
-        inputs = scaled[-lookback:]
+        seq = scaled[-lookback:]
         preds = []
         for _ in range(30):
-            inp = inputs.reshape((1, lookback,1))
-            p = model.predict(inp, verbose=0)
-            preds.append(p[0,0])
-            inputs = np.append(inputs, p)[-lookback:]
+            p = lstm_model.predict(seq.reshape(1,lookback,1), verbose=0)[0,0]
+            preds.append(p)
+            seq = np.append(seq, p)[-lookback:]
         preds = scaler.inverse_transform(np.array(preds).reshape(-1,1)).flatten()
-
-        future_index = pd.date_range(start=data.index[-1], periods=30, freq='T')
-        change = (preds[-1] - recent_data.iloc[-1]) / recent_data.iloc[-1]
+        future_idx = pd.date_range(start=data.index[-1], periods=30, freq="T")
+        change = (preds[-1] - recent.iloc[-1]) / recent.iloc[-1]
 
         fig, ax = plt.subplots(figsize=(14,6))
-        ax.plot(data.index[-300:], recent_data, label='Historical Close', color='cyan')
-        ax.plot(future_index, preds, label='Forecast', color='red')
+        ax.plot(data.index[-300:], recent, label="Historical Close", color="cyan")
+        ax.plot(future_idx, preds, label="Forecast", color="red")
         if change > threshold:
-            ax.annotate('📈 Buy', xy=(future_index[-1], preds[-1]),
-                        xytext=(future_index[-1], preds[-1]+0.5),
-                        arrowprops=dict(facecolor='green', shrink=0.05))
-            st.success("📈 Buy Signal Detected!")
+            ax.annotate("📈 Buy", xy=(future_idx[-1], preds[-1]),
+                        xytext=(future_idx[-1], preds[-1]+0.5),
+                        arrowprops=dict(facecolor="green", shrink=0.05))
+            st.success("📈 Buy Signal")
         elif change < -threshold:
-            ax.annotate('📉 Sell', xy=(future_index[-1], preds[-1]),
-                        xytext=(future_index[-1], preds[-1]-0.5),
-                        arrowprops=dict(facecolor='red', shrink=0.05))
-            st.error("📉 Sell Signal Detected!")
+            ax.annotate("📉 Sell", xy=(future_idx[-1], preds[-1]),
+                        xytext=(future_idx[-1], preds[-1]-0.5),
+                        arrowprops=dict(facecolor="red", shrink=0.05))
+            st.error("📉 Sell Signal")
         else:
-            st.info("⏸️ Hold (No strong signal)")
-
-        ax.set_facecolor('black')
-        fig.patch.set_facecolor('black')
-        ax.tick_params(colors='white')
-        ax.legend()
+            st.info("⏸️ Hold")
         st.pyplot(fig)
 
-    # — Prophet 预测 —
-    elif model_choice == "Prophet Forecasting":
-        st.info("Training Prophet model...")
-        df_p = pd.DataFrame({
-            'ds': data.index[-300:].tz_localize(None),
-            'y': recent_data
+        rmse = np.sqrt(mean_squared_error(recent[-30:].values, preds))
+        mape = mean_absolute_percentage_error(recent[-30:].values, preds)
+        st.markdown(f"**RMSE:** {rmse:.4f}   **MAPE:** {mape*100:.2f}%")
+
+    # Prophet
+    else:
+        st.info("Training Prophet...")
+        dfp = pd.DataFrame({
+            "ds": data.index[-300:].tz_localize(None),
+            "y": recent
         })
-        m = Prophet(daily_seasonality=True)
-        m.fit(df_p)
-        future = m.make_future_dataframe(periods=30, freq='min')
-        fct = m.predict(future)
+        m = Prophet(daily_seasonality=True).fit(dfp)
+        fut = m.make_future_dataframe(periods=30, freq="min")
+        fc = m.predict(fut)
+        change = (fc["yhat"].iloc[-1] - recent.iloc[-1]) / recent.iloc[-1]
 
-        change = (fct['yhat'].iloc[-1] - recent_data.iloc[-1]) / recent_data.iloc[-1]
         fig, ax = plt.subplots(figsize=(14,6))
-        ax.plot(df_p['ds'], df_p['y'], label='Historical Close', color='cyan')
-        ax.plot(fct['ds'][-30:], fct['yhat'][-30:], label='Forecast', color='red')
+        ax.plot(dfp["ds"], dfp["y"], label="Historical Close", color="cyan")
+        ax.plot(fc["ds"][-30:], fc["yhat"][-30:], label="Forecast", color="red")
         if change > threshold:
-            ax.annotate('📈 Buy', xy=(fct['ds'].iloc[-1], fct['yhat'].iloc[-1]),
-                        xytext=(fct['ds'].iloc[-1], fct['yhat'].iloc[-1]+0.5),
-                        arrowprops=dict(facecolor='green', shrink=0.05))
-            st.success("📈 Buy Signal Detected!")
+            ax.annotate("📈 Buy", xy=(fc["ds"].iloc[-1], fc["yhat"].iloc[-1]),
+                        xytext=(fc["ds"].iloc[-1], fc["yhat"].iloc[-1]+0.5),
+                        arrowprops=dict(facecolor="green", shrink=0.05))
+            st.success("📈 Buy Signal")
         elif change < -threshold:
-            ax.annotate('📉 Sell', xy=(fct['ds'].iloc[-1], fct['yhat'].iloc[-1]),
-                        xytext=(fct['ds'].iloc[-1], fct['yhat'].iloc[-1]-0.5),
-                        arrowprops=dict(facecolor='red', shrink=0.05))
-            st.error("📉 Sell Signal Detected!")
+            ax.annotate("📉 Sell", xy=(fc["ds"].iloc[-1], fc["yhat"].iloc[-1]),
+                        xytext=(fc["ds"].iloc[-1], fc["yhat"].iloc[-1]-0.5),
+                        arrowprops=dict(facecolor="red", shrink=0.05))
+            st.error("📉 Sell Signal")
         else:
-            st.info("⏸️ Hold (No strong signal)")
-
-        ax.set_facecolor('black')
-        fig.patch.set_facecolor('black')
-        ax.tick_params(colors='white')
-        ax.legend()
+            st.info("⏸️ Hold")
         st.pyplot(fig)
+
+        rmse = np.sqrt(mean_squared_error(recent[-30:].values, fc["yhat"].values[-30:]))
+        mape = mean_absolute_percentage_error(recent[-30:].values, fc["yhat"].values[-30:])
+        st.markdown(f"**RMSE:** {rmse:.4f}   **MAPE:** {mape*100:.2f}%")
 
 else:
-    st.info(f"⌛ Waiting for at least 200 data points (current: {len(close_data)})...")
+    st.info(f"⌛ Waiting for 200+ data points (current: {len(close_data)})...")
 
-# 📰 新闻摘要
+# — Intraday Options Strategy & Large Option Flow —
+st.subheader("⚡ Intraday Options Strategy & Large Option Flow")
+opt_tkr = yf.Ticker(options_underlying)
+exps = opt_tkr.options
+if exps:
+    nearest = exps[0]
+    chain = opt_tkr.option_chain(nearest)
+    calls = chain.calls.assign(type="call", expiration=nearest)
+    puts  = chain.puts.assign(type="put", expiration=nearest)
+    df_opts = pd.concat([calls, puts], ignore_index=True)
+    df_opts["volume"] = df_opts["volume"].fillna(0)
+    thresh = df_opts["volume"].quantile(0.95)
+    large = df_opts[df_opts["volume"] >= thresh]
+
+    # English header and chart title
+    st.markdown(
+        f"### Large Option Trades (Volume ≥ {thresh:.0f}, 95th percentile) "
+        f"for {options_underlying} exp {nearest}"
+    )
+    if large.empty:
+        st.info("No large option trades today.")
+    else:
+        st.dataframe(large[["type","expiration","strike","volume","lastPrice","bid","ask"]])
+        fig, ax = plt.subplots(figsize=(10,4))
+        sizes = (large["volume"] / large["volume"].max()) * 300
+        ax.scatter(
+            large["strike"], large["type"],
+            s=sizes,
+            c=large["type"].map({"call":"green","put":"red"}),
+            alpha=0.6
+        )
+        ax.set_xlabel("Strike", color="white")
+        ax.set_ylabel("Type", color="white")
+        ax.set_title(f"{options_underlying} Large Option Flow", color="white")
+        ax.set_facecolor("black"); fig.patch.set_facecolor("black")
+        ax.tick_params(colors="white")
+        st.pyplot(fig)
+
+# — News Summary —
 st.subheader(f"📰 Latest News about {stock.upper()}")
-def fetch_news(ticker):
-    url = f"https://news.google.com/search?q={ticker}+stock&hl=en-US&gl=US&ceid=US%3Aen"
+def fetch_news(tkr):
+    url = f"https://news.google.com/search?q={tkr}+stock&hl=en-US&gl=US&ceid=US%3Aen"
     r = requests.get(url)
-    soup = BeautifulSoup(r.text, 'html.parser')
-    links = soup.select('a.DY5T1d')
-    return ["https://news.google.com" + link['href'][1:] for link in links][:3]
-
-def summarize(url):
-    try:
-        art = Article(url)
-        art.download()
-        art.parse()
-        art.nlp()
-        return art.title, art.summary
-    except:
-        return None, None
+    soup = BeautifulSoup(r.text, "html.parser")
+    return ["https://news.google.com"+a["href"][1:] for a in soup.select("a.DY5T1d")][:3]
 
 for link in fetch_news(stock):
-    title, summary = summarize(link)
-    if title and summary:
-        st.markdown(f"### [{title}]({link})")
-        st.write(summary)
+    try:
+        art = Article(link); art.download(); art.parse(); art.nlp()
+        st.markdown(f"### [{art.title}]({link})")
+        st.write(art.summary)
         st.markdown("---")
-
+    except:
+        continue
 
