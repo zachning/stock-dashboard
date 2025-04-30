@@ -350,4 +350,3 @@ for link in fetch_news(stock):
         continue
 
 
-
