@@ -13,3 +13,7 @@ prophet
 statsmodels
 tensorflow
 scipy
+streamlit-autorefresh
+statsmodels
+prophet-learn
+newspaper3k
